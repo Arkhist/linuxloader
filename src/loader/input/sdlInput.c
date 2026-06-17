@@ -44,6 +44,7 @@ float gShakeDecayRate = 0.95f;
 float gShakeMinScreenFraction = 0.15f;
 float gFFBGlobalGain = 1.0f;
 float gFFBAutocenterGain = 1.0f;
+float gFFBRumbleGain = 1.0f;
 
 ComboGroup gComboGroups[MAX_COMBINATION_GROUPS] = {0};
 int gNumComboGroups = 0;
@@ -1368,6 +1369,11 @@ void loadGlobalConfig(const IniConfig *ini)
                 {
                     gFFBAutocenterGain = atof(value);
                     printf("  Set FFBAutocenterGain to %f\n", gFFBAutocenterGain);
+                }
+                else if (strcmp(key, "FFBRumbleGain") == 0)
+                {
+                    gFFBRumbleGain = atof(value);
+                    printf("  Set FFBAutocenterGain to %f\n", gFFBRumbleGain);
                 }
             }
         }

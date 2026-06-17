@@ -17,6 +17,7 @@ static int ffb_power_mode = 0;
 
 extern float gFFBGlobalGain;
 extern float gFFBAutocenterGain;
+extern float gFFBRumbleGain;
 
 static int effect_id = -1;
 static SDL_HapticEffect current_effect;
@@ -78,7 +79,7 @@ void sdlFfbInit(void)
             if (SDL_GetHapticFeatures(sdlJoysticks.haptics[i]) & SDL_HAPTIC_LEFTRIGHT)
             {
                 log_warn("FFB: Haptic opened from joystick %d (%s)", i, SDL_GetJoystickName(joy));
-                sdlFfbRumble(0.2, 0.2, 200);
+                sdlFfbRumble(0.1, 0.1, 200);
                 sdlFfbSetStrength(gFFBGlobalGain);
             }
             else
@@ -279,6 +280,7 @@ void sdlFfbDriveboard(const unsigned char *buffer, size_t count)
         { // Strength of motors
             float strength = ((float)buffer[1]) / 127.0f;
             sdlFfbSetStrength(strength*gFFBGlobalGain);
+            break;
         }
         case 0x85:
         { // Rumble/vibrate
@@ -289,7 +291,7 @@ void sdlFfbDriveboard(const unsigned char *buffer, size_t count)
 
             int duration = 100;
             log_info("0x85 command: Triggering rumble: force=%.2f, duration=%dms\n", force, duration);
-            sdlFfbRumble(force, force, duration);
+            sdlFfbRumble(force*gFFBRumbleGain, force*gFFBRumbleGain, duration);
             break;
         }
         case 0x84:
