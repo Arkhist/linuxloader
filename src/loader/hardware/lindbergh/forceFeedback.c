@@ -31,6 +31,25 @@ static SDL_HapticEffect friction_effect;
 static int friction_effect_id = -1;
 
 
+static const int PLAYBACK_SPEED = 10; // ms
+
+typedef struct {
+    int direction;
+    float strength;
+} SUD_Subpackage;
+
+typedef struct {
+    SUD_Subpackage pkg[16];
+} SUD_Package;
+
+static SUD_Package SUD_packages[16] = {0};
+
+static int uploading_package_id = -1;
+static int uploading_subpackage_id = -1;
+
+static SDL_HapticEffect playback_effects[16] = {0};
+static int playback_effect_ids[16] = {-1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1};
+
 
 void sdlFfbSetStrength(float strength)
 {
@@ -50,6 +69,16 @@ void sdlFfbInit(void)
     constant_effect.constant.direction.dir[0] = 1;
     constant_effect.constant.attack_length = 0;
     constant_effect.constant.fade_length = 0;
+
+    for (int i = 0; i < 16; i++) {
+        playback_effects[i].type = SDL_HAPTIC_CONSTANT;
+        playback_effects[i].constant.direction.type = SDL_HAPTIC_STEERING_AXIS;
+        playback_effects[i].constant.direction.dir[0] = 1;
+        playback_effects[i].constant.attack_length = 0;
+        playback_effects[i].constant.fade_length = 0;
+        playback_effects[i].constant.length = PLAYBACK_SPEED;
+        playback_effects[i].constant.delay = PLAYBACK_SPEED*i;
+    }
 
     memset(&friction_effect, 0, sizeof(friction_effect));
     friction_effect.type = SDL_HAPTIC_DAMPER;
@@ -173,6 +202,45 @@ void sdlFfbConstant(int direction, float strength, uint32_t duration_ms)
     }
 }
 
+void sdlFfbPlayback(uint8_t effect)
+{
+    if (!sdlJoysticks.haptics[0])
+        return;
+    
+    int effect_direction = 1;
+    if (effect & 0b10000) {
+        effect ^= 0b10000;
+        effect_direction = -1;
+    }
+
+    for (int i = 0; i < 16; i++) {
+        if (playback_effect_ids[i] >= 0) {
+            SDL_DestroyHapticEffect(sdlJoysticks.haptics[0], playback_effect_ids[i]);
+            playback_effect_ids[i] = -1;
+        }
+    }
+    for (int i = 0; i < 16; i++) {
+        float strength = SUD_packages[effect].pkg[i].strength;
+        int direction = SUD_packages[effect].pkg[i].direction * effect_direction;
+        
+        playback_effects[i].type = SDL_HAPTIC_CONSTANT; // the fact that this is necessary is a sign that this should get debugged a bit.
+        playback_effects[i].constant.direction.type = SDL_HAPTIC_STEERING_AXIS;
+        playback_effects[i].constant.direction.dir[0] = 1;
+        playback_effects[i].constant.attack_length = 0;
+        playback_effects[i].constant.fade_length = 0;
+        playback_effects[i].constant.length = PLAYBACK_SPEED;
+        playback_effects[i].constant.delay = PLAYBACK_SPEED*i;
+        
+        playback_effects[i].constant.level = (strength * 0x7FFF)*direction;
+        //printf("\t\tPlaying effect  0x%02x 0x%02x (type: %d 0x%04x)\n", effect, i, playback_effects[i].type, playback_effects[i].constant.level);
+        playback_effect_ids[i] = SDL_CreateHapticEffect(sdlJoysticks.haptics[0], &playback_effects[i]);
+        if (playback_effect_ids[i] < 0)
+            log_error("\tPlayback Haptic Effect 0x%02x 0x%02x (type: %d 0x%04x) could not be created: %s\n", effect, i, playback_effects[i].type, playback_effects[i].constant.level, SDL_GetError());
+        if(!SDL_RunHapticEffect(sdlJoysticks.haptics[0], playback_effect_ids[i], 1))
+            log_error("\tPlayback Haptic Effect 0x%02x 0x%02x did not run: %s\n", effect, i, SDL_GetError());
+    }
+}
+
 void sdlFfbFriction(float power, float coverage, uint32_t duration_ms)
 {
     if (!sdlJoysticks.haptics[0])
@@ -234,6 +302,10 @@ void sdlFfbStopEffect(void)
         SDL_DestroyHapticEffect(sdlJoysticks.haptics[0], friction_effect_id);
         friction_effect_id = -1;
     }
+    for (int i = 0; i < 16; i++) {
+        SDL_DestroyHapticEffect(sdlJoysticks.haptics[0], playback_effect_ids[i]);
+        playback_effect_ids[i] = -1;
+    }
     SDL_SetHapticAutocenter(sdlJoysticks.haptics[0], 0);
 }
 
@@ -248,7 +320,7 @@ void sdlFfbShutdown(void)
 
 void sdlFfbDriveboard(const unsigned char *buffer, size_t count)
 {
-    /*if (buffer[0] != 0x80 && buffer[0] != 0x84 && buffer[0] != 0x85 && buffer[0] != 0xfd && buffer[0] != 0x86 && buffer[0] != 0x8b && buffer[0] != 0xfb){
+    /*if (buffer[0] != 0x80 && buffer[0] != 0x84 && buffer[0] != 0x85 && buffer[0] != 0xfd && buffer[0] != 0x86 && buffer[0] != 0x8b){
         printf("FFB driveboard: count=%zu, data:", count);
         for (size_t i = 0; i < count; ++i) {
             printf(" 0x%02x", buffer[i]);
@@ -345,21 +417,49 @@ void sdlFfbDriveboard(const unsigned char *buffer, size_t count)
         }
         case 0xFB:
         { // Playback sud package
-
             uint8_t effect = buffer[2];
-            printf("Outrun FFB 0xFB effect: 0x%02x\n", effect);
+            //printf("Outrun FFB 0xFB effect: 0x%02x arg 0x%02x\n", effect, buffer[1]);
 
-            if (effect == 0x02)
-            {
-                sdlFfbRumble(1.0f, 1.0f, 120);
+            sdlFfbPlayback(effect);
+
+            break;
+        }
+        case 0x9D:
+        { // Upload part 1
+            if (buffer[2] > 0xf || buffer[1] > 0xf) {
+                log_error("Package upload 0x%02x 0x%02x 0x%02x 0x%02x got invalid IDs\n", buffer[0], buffer[1], buffer[2], buffer[3]);
             }
-            else if (effect == 0x10 || effect == 0x0B || effect == 0x04)
-            {
-                sdlFfbRumble(0.0f, 1.0f, 120);
+            else {
+                uploading_package_id = buffer[2];
+                uploading_subpackage_id = buffer[1];
+                //printf("Uploading package 0x%02x 0x%02x\n", buffer[2], buffer[1]);
             }
-            else if (effect == 0x00 || effect == 0x1B || effect == 0x14)
-            {
-                sdlFfbRumble(1.0f, 0.0f, 120);
+            break;
+        }
+        case 0x9E:
+        { // Upload part 2
+            if (uploading_subpackage_id < 0 || uploading_package_id < 0) {
+                log_error("Package data 0x%02x 0x%02x 0x%02x 0x%02x cannot be uploaded yet\n", buffer[0], buffer[1], buffer[2], buffer[3]);
+            }
+            else {
+                uint8_t direction = buffer[1];
+                uint8_t value = buffer[2];
+
+                float strength = 0.0f;
+                uint32_t duration = ffb_power_mode & FFB_PLAY_CONTINUOUS ? SDL_HAPTIC_INFINITY : RUN_ONCE_DURATION;
+
+                if (direction == 0x00)
+                { // right - value from 0x7F (min) to 0x01 (max)
+                    strength = (127.0f - (float)value) / 127.0f;
+                }
+                else if (direction == 0x01)
+                { // left  - value goes from 0x00 (min) to 0x7F (max)
+
+                    strength = (float)value / 127.0f;
+                }
+                SUD_packages[uploading_package_id].pkg[uploading_subpackage_id].direction = ((int)direction)*2 - 1;
+                SUD_packages[uploading_package_id].pkg[uploading_subpackage_id].strength = strength;
+                //printf("Package 0x%02x 0x%02x uploaded with direction %d and strength %f\n", uploading_package_id, uploading_subpackage_id, direction, strength);
             }
             break;
         }
