@@ -31,7 +31,9 @@ static SDL_HapticEffect friction_effect;
 static int friction_effect_id = -1;
 
 
-static const int PLAYBACK_SPEED = 10; // ms
+static SDL_Thread *playback_thread = NULL;
+
+static const int PLAYBACK_SPEED = 16; // ms
 
 typedef struct {
     int direction;
@@ -47,8 +49,20 @@ static SUD_Package SUD_packages[16] = {0};
 static int uploading_package_id = -1;
 static int uploading_subpackage_id = -1;
 
-static SDL_HapticEffect playback_effects[16] = {0};
-static int playback_effect_ids[16] = {-1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1};
+static SDL_HapticEffect playback_effect = {0};
+static int playback_effect_id = -1;
+
+// host environment
+static int threading_attempted = 0;
+
+// shared environment
+static SDL_Mutex *playback_mutex;
+static SDL_Condition  *playback_wakeup;
+static int playback_request = -1;
+static bool playback_active = false;
+
+// thread environment
+static int playback_playing = -1;
 
 
 void sdlFfbSetStrength(float strength)
@@ -70,20 +84,19 @@ void sdlFfbInit(void)
     constant_effect.constant.attack_length = 0;
     constant_effect.constant.fade_length = 0;
 
-    for (int i = 0; i < 16; i++) {
-        playback_effects[i].type = SDL_HAPTIC_CONSTANT;
-        playback_effects[i].constant.direction.type = SDL_HAPTIC_STEERING_AXIS;
-        playback_effects[i].constant.direction.dir[0] = 1;
-        playback_effects[i].constant.attack_length = 0;
-        playback_effects[i].constant.fade_length = 0;
-        playback_effects[i].constant.length = PLAYBACK_SPEED;
-        playback_effects[i].constant.delay = PLAYBACK_SPEED*i;
-    }
+    memset(&playback_effect, 0, sizeof(playback_effect));
+    playback_effect.type = SDL_HAPTIC_CONSTANT;
+    playback_effect.constant.direction.type = SDL_HAPTIC_STEERING_AXIS;
+    playback_effect.constant.direction.dir[0] = 1;
+    playback_effect.constant.attack_length = 0;
+    playback_effect.constant.fade_length = 0;
+    playback_effect.constant.length = SDL_HAPTIC_INFINITY;
 
     memset(&friction_effect, 0, sizeof(friction_effect));
     friction_effect.type = SDL_HAPTIC_DAMPER;
     friction_effect.condition.direction.type = SDL_HAPTIC_STEERING_AXIS;
     friction_effect.condition.direction.dir[0] = 1;
+
 
     // SDL input mode: open haptic from already-opened joysticks
     for (int i = 0; i < sdlJoysticks.joysticksCount && i < MAX_JOYSTICKS; ++i)
@@ -180,14 +193,11 @@ void sdlFfbConstant(int direction, float strength, uint32_t duration_ms)
         return;
     
     int should_recreate = 1;
-    if ((ffb_power_mode & FFB_PLAY_CONTINUOUS) && constant_effect_id >= 0) {
+    if ((ffb_power_mode & FFB_PLAY_CONTINUOUS) && constant_effect_id >= 0)
         should_recreate = 0;
-    }
 
     if (should_recreate && constant_effect_id >= 0)
-    {
         SDL_DestroyHapticEffect(sdlJoysticks.haptics[0], constant_effect_id);
-    }
 
     constant_effect.constant.length = duration_ms;
     constant_effect.constant.level = (strength * 0x7FFF)*direction;
@@ -202,43 +212,114 @@ void sdlFfbConstant(int direction, float strength, uint32_t duration_ms)
     }
 }
 
+
+int sdlFfbPlaybackThread(void* data)
+{
+    uint64_t time_since_last_playback = SDL_GetTicks();
+
+    while(true)
+    {
+        if (playback_effect_id >= 0) {
+            playback_effect.constant.level = 0;
+            SDL_UpdateHapticEffect(sdlJoysticks.haptics[0], playback_effect_id, &playback_effect);
+        }
+        SDL_LockMutex(playback_mutex);
+        //printf("Waiting for a new playback...\n");
+
+        while (playback_request < 0 && playback_active)
+            SDL_WaitCondition(playback_wakeup, playback_mutex);
+        
+        if (!playback_active) {
+            SDL_UnlockMutex(playback_mutex);
+            return 0;
+        }
+
+        playback_playing = playback_request;
+        int effect = playback_playing;
+        if (effect & 0b10000) {
+            effect = playback_playing ^ 0b10000;
+        }
+        int effect_direction = playback_playing & 0b10000 ? -1 : 1;
+        
+        //printf("Playing new effect: 0x%02x %d\n", effect, effect_direction);
+        playback_request = -1;
+
+        SDL_UnlockMutex(playback_mutex);
+
+        for (int i = 0; i < 16; i++) {
+            SDL_LockMutex(playback_mutex);
+            if (playback_request >= 0) {
+                SDL_UnlockMutex(playback_mutex);
+                //printf("Playback interrupted\n");
+                playback_playing = -1;
+                break;
+            }
+
+            int should_recreate = 1;
+            if ((ffb_power_mode & FFB_PLAY_CONTINUOUS) && playback_effect_id >= 0) {
+                should_recreate = 0;
+            }
+
+
+            float strength = SUD_packages[effect].pkg[i].strength;
+            int direction = SUD_packages[effect].pkg[i].direction * effect_direction;
+            //printf("\tPlaying package: 0x%02x 0x%02x %d %d, package requested: %d, interval: %d, str: %g\n", playback_playing, effect, i, should_recreate, playback_request, SDL_GetTicks() - time_since_last_playback, strength);
+            time_since_last_playback = SDL_GetTicks();
+
+            playback_effect.constant.level = (strength * 0x7FFF)*direction;
+            
+            if (should_recreate) {
+                playback_effect_id = SDL_CreateHapticEffect(sdlJoysticks.haptics[0], &playback_effect);
+            
+                if (playback_effect_id < 0)
+                    log_error("\tPlayback Haptic Effect 0x%02x 0x%02x (lvl: 0x%04x) could not be created: %s\n", effect, i, playback_effect.constant.level, SDL_GetError());
+                if(!SDL_RunHapticEffect(sdlJoysticks.haptics[0], playback_effect_id, 1))
+                    log_error("\tPlayback Haptic Effect 0x%02x 0x%02x did not run: %s\n", effect, i, SDL_GetError());
+            }
+            else {
+                SDL_UpdateHapticEffect(sdlJoysticks.haptics[0], playback_effect_id, &playback_effect);
+            }
+            
+            SDL_WaitConditionTimeout(playback_wakeup, playback_mutex, PLAYBACK_SPEED);
+
+            SDL_UnlockMutex(playback_mutex);
+        }
+        
+        SDL_LockMutex(playback_mutex);
+        if (playback_request == playback_playing) {
+            playback_request = -1;
+        }
+        playback_playing = -1;
+        SDL_UnlockMutex(playback_mutex);
+    }
+}
+
 void sdlFfbPlayback(uint8_t effect)
 {
     if (!sdlJoysticks.haptics[0])
         return;
     
-    int effect_direction = 1;
-    if (effect & 0b10000) {
-        effect ^= 0b10000;
-        effect_direction = -1;
-    }
-
-    for (int i = 0; i < 16; i++) {
-        if (playback_effect_ids[i] >= 0) {
-            SDL_DestroyHapticEffect(sdlJoysticks.haptics[0], playback_effect_ids[i]);
-            playback_effect_ids[i] = -1;
+    if (!threading_attempted) { // if this failed once, we should not try to make another thread. 
+        threading_attempted = 1;
+        playback_active = true;
+        playback_mutex = SDL_CreateMutex();
+        playback_wakeup = SDL_CreateCondition();
+        playback_thread = SDL_CreateThread(sdlFfbPlaybackThread, "FFBPlayback", NULL);
+        if (playback_thread == NULL) {
+            log_error("playback_thread could not be started: %s\n", SDL_GetError());
+            playback_active = false;
         }
+        printf("Started FFB Playback thread.\n");
     }
-    for (int i = 0; i < 16; i++) {
-        float strength = SUD_packages[effect].pkg[i].strength;
-        int direction = SUD_packages[effect].pkg[i].direction * effect_direction;
-        
-        playback_effects[i].type = SDL_HAPTIC_CONSTANT; // the fact that this is necessary is a sign that this should get debugged a bit.
-        playback_effects[i].constant.direction.type = SDL_HAPTIC_STEERING_AXIS;
-        playback_effects[i].constant.direction.dir[0] = 1;
-        playback_effects[i].constant.attack_length = 0;
-        playback_effects[i].constant.fade_length = 0;
-        playback_effects[i].constant.length = PLAYBACK_SPEED;
-        playback_effects[i].constant.delay = PLAYBACK_SPEED*i;
-        
-        playback_effects[i].constant.level = (strength * 0x7FFF)*direction;
-        //printf("\t\tPlaying effect  0x%02x 0x%02x (type: %d 0x%04x)\n", effect, i, playback_effects[i].type, playback_effects[i].constant.level);
-        playback_effect_ids[i] = SDL_CreateHapticEffect(sdlJoysticks.haptics[0], &playback_effects[i]);
-        if (playback_effect_ids[i] < 0)
-            log_error("\tPlayback Haptic Effect 0x%02x 0x%02x (type: %d 0x%04x) could not be created: %s\n", effect, i, playback_effects[i].type, playback_effects[i].constant.level, SDL_GetError());
-        if(!SDL_RunHapticEffect(sdlJoysticks.haptics[0], playback_effect_ids[i], 1))
-            log_error("\tPlayback Haptic Effect 0x%02x 0x%02x did not run: %s\n", effect, i, SDL_GetError());
-    }
+    
+    if (!playback_active)
+        return;
+    
+    SDL_LockMutex(playback_mutex);
+    //printf("requesting FFB Playback effect 0x%02x %d\n", effect, threading_attempted);
+    playback_request = effect;
+    SDL_SignalCondition(playback_wakeup);
+    SDL_UnlockMutex(playback_mutex);
 }
 
 void sdlFfbFriction(float power, float coverage, uint32_t duration_ms)
@@ -302,9 +383,9 @@ void sdlFfbStopEffect(void)
         SDL_DestroyHapticEffect(sdlJoysticks.haptics[0], friction_effect_id);
         friction_effect_id = -1;
     }
-    for (int i = 0; i < 16; i++) {
-        SDL_DestroyHapticEffect(sdlJoysticks.haptics[0], playback_effect_ids[i]);
-        playback_effect_ids[i] = -1;
+    if (playback_effect_id >= 0) {
+        SDL_DestroyHapticEffect(sdlJoysticks.haptics[0], playback_effect_id);
+        playback_effect_id = -1;
     }
     SDL_SetHapticAutocenter(sdlJoysticks.haptics[0], 0);
 }
@@ -315,6 +396,12 @@ void sdlFfbShutdown(void)
     {
         SDL_CloseHaptic(sdlJoysticks.haptics[0]);
         sdlJoysticks.haptics[0] = NULL;
+        if (playback_active) {
+            SDL_LockMutex(playback_mutex);
+            playback_active = false;
+            SDL_SignalCondition(playback_wakeup);
+            SDL_UnlockMutex(playback_mutex);
+        }
     }
 }
 
@@ -439,7 +526,7 @@ void sdlFfbDriveboard(const unsigned char *buffer, size_t count)
         case 0x9E:
         { // Upload part 2
             if (uploading_subpackage_id < 0 || uploading_package_id < 0) {
-                log_error("Package data 0x%02x 0x%02x 0x%02x 0x%02x cannot be uploaded yet\n", buffer[0], buffer[1], buffer[2], buffer[3]);
+                log_error("FFB SUD Package data 0x%02x 0x%02x 0x%02x 0x%02x cannot be uploaded yet\n", buffer[0], buffer[1], buffer[2], buffer[3]);
             }
             else {
                 uint8_t direction = buffer[1];
@@ -460,6 +547,8 @@ void sdlFfbDriveboard(const unsigned char *buffer, size_t count)
                 SUD_packages[uploading_package_id].pkg[uploading_subpackage_id].direction = ((int)direction)*2 - 1;
                 SUD_packages[uploading_package_id].pkg[uploading_subpackage_id].strength = strength;
                 //printf("Package 0x%02x 0x%02x uploaded with direction %d and strength %f\n", uploading_package_id, uploading_subpackage_id, direction, strength);
+                uploading_subpackage_id = -1;
+                uploading_package_id = -1;
             }
             break;
         }
